@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+# For the full notebook (GPU):
+# torch
+# transformers
+# accelerate
+# bitsandbytes
+# datasets

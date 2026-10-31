@@ -1,0 +1,306 @@
+\documentclass[conference]{IEEEtran}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{url}
+\usepackage{placeins}
+\usepackage[hidelinks]{hyperref}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\renewcommand{\arraystretch}{1.15}
+
+\begin{document}
+
+\title{Are Hallucination Probes Evaluated Correctly? A Critical Review and a Pilot Study under 4-bit Quantization}
+
+\author{\IEEEauthorblockN{Mritunjay Sharma}
+\IEEEauthorblockA{Independent Researcher\\
+Delhi, India\\
+mritunjaysharma080505@gmail.com}}
+
+\maketitle
+
+\begin{abstract}
+Linear probes trained on a language model's hidden states are among the cheapest hallucination detectors, and many papers report AUROC above 0.9. A growing body of 2025--2026 work suggests these numbers often measure something other than the ability to tell a correct answer from a wrong one. We review how hallucination probes are evaluated and organize the known failure modes into five groups: noisy correctness labels, pooled metrics that mix question difficulty with answer correctness, question-side shortcuts, text artifacts that simple baselines exploit, and weak generalization. We then examine a deployment setting the literature has barely addressed: probes trained at full precision but used on quantized models. Existing quantization studies report only pooled metrics, so they cannot show whether the answer-level signal survives compression. We propose a 12-item reporting checklist and apply it in a pilot study on Qwen2.5-1.5B-Instruct with 1,000 TriviaQA questions at FP16, INT8 and NF4. A question-only probe reaches 0.73 pooled AUROC without seeing any answer, against 0.85 for the answer probe, so most of the pooled signal reflects question difficulty. The within-question AUROC of 0.76 confirms a genuine answer-level signal, and it did not measurably change under NF4 (difference $-0.002$, 95\% CI $[-0.08, 0.09]$). The pilot is small, and its confidence intervals rule out only large degradations; we report it as a worked example of the checklist rather than a definitive result.
+\end{abstract}
+
+\begin{IEEEkeywords}
+hallucination detection, probing, large language models, uncertainty estimation, evaluation methodology, quantization
+\end{IEEEkeywords}
+
+%=====================================================
+\section{Introduction}
+
+Hallucination probes have spread fast because they are cheap. A probe is usually a logistic regression on one layer's hidden state, so it adds almost no cost to inference. Sampling-based methods such as semantic entropy~\cite{farquhar2024semantic} need several generations per query; Semantic Entropy Probes~\cite{kossen2024sep} approximate that signal from a single forward pass. Reported AUROCs are often high, sometimes near 1.0~\cite{aiersilan2026quantized}.
+
+Recent work questions what those numbers mean. Correctness labels from string overlap inflate scores~\cite{illusion2025}. On HaluEval, a TF-IDF similarity baseline with no access to model internals reaches 0.98 AUROC~\cite{hussain2026parallax}. Probes that do well in-distribution fail out of distribution~\cite{ood2025}, and truth directions learned on one task are near-orthogonal to those on another~\cite{orthogonal2025}. Much of the signal can be read from the question alone, before any answer exists~\cite{cencerrado2025noanswer,seo2025aqe}.
+
+These critiques are scattered across separate papers, each addressing one problem. Meanwhile probes are moving onto consumer hardware, where models run quantized~\cite{aiersilan2026quantized}. We found no work that asks whether current evaluation practice can tell us if a probe still works after compression.
+
+\textbf{Scope.} We cover probes that read hidden states to predict whether a model's own answer is correct, for short-answer, closed-book QA. Sampling-based and logit-based detectors appear only as baselines. We do not cover retrieval-grounded faithfulness checkers or external fact-checking. The literature is current to 30 October 2026; many cited works are unreviewed preprints, and their numbers are reported claims.
+
+\textbf{Contributions.}
+\begin{enumerate}
+\item A taxonomy of five evaluation failure modes for hallucination probes, each linked to the evidence that documents it (Section~\ref{sec:failure}).
+\item An analysis of what existing quantization and KV-cache studies can and cannot show about probe validity under compression (Section~\ref{sec:compression}).
+\item A 12-item reporting checklist for probe papers (Section~\ref{sec:checklist}).
+\item A pilot study that applies the checklist to a 1.5B model at three precisions, including the within-question and question-only comparisons the quantization literature lacks (Section~\ref{sec:pilot}).
+\end{enumerate}
+
+%=====================================================
+\section{Background}
+
+\subsection{What a Hallucination Probe Is}
+Given a question $q$ and the model's answer $a$, a probe maps a hidden state $h(q,a)$ at some layer and token position to a score $s$, trained so that higher $s$ means the answer is more likely correct. Early work showed language models carry information about their own correctness: models can estimate $P(\text{True})$ for their answers~\cite{kadavath2022know}, a classifier on hidden states separates true from false statements~\cite{azaria2023internal}, and truth can be found without labels through consistency constraints~\cite{burns2023discovering}. Later work found truth is often linearly represented~\cite{marks2023geometry}.
+
+\subsection{Design Choices}
+Probe papers differ along four axes, and each one affects what the reported number means (Table~\ref{tab:design}).
+
+\begin{table}[!t]
+\caption{Probe design axes and why they matter for evaluation}
+\label{tab:design}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}L{1.3cm}YY@{}}
+\toprule
+Axis & Common options & Why it matters \\
+\midrule
+Answers & Supplied true/false statements; the model's own greedy answer; several sampled answers per question & Supplied statements test knowledge of facts, not self-knowledge of one's own output \\
+Token position & Last question token; last answer token; mean over answer; exact-answer tokens~\cite{orgad2025know} & Last-question-token probes see no answer, so they can only measure question difficulty~\cite{cencerrado2025noanswer} \\
+Target & Correctness label; semantic entropy~\cite{kossen2024sep}; self-judgement & Different targets measure different things \\
+Probe type & Logistic regression; MLP; multi-layer probes~\cite{hussain2026parallax} & More capacity raises the risk of fitting artifacts \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{How Probes Are Scored}
+Most papers report AUROC over all test answers pooled together, sometimes with accuracy, AUPRC or calibration error. Pooled AUROC answers the question: ``given a random correct answer and a random incorrect one, does the probe rank the correct one higher?'' The two answers usually come from different questions. Section~\ref{sec:pooled} explains why this matters.
+
+\subsection{Why Compression Is Relevant}
+Weight quantization to 8 bits~\cite{dettmers2022int8} or 4-bit NF4~\cite{dettmers2023qlora} lets 7--8B models run on consumer GPUs. Probes are usually trained at full precision, but recent probe work already runs on 4-bit models~\cite{aiersilan2026quantized}.
+
+%=====================================================
+\section{Five Failure Modes in Probe Evaluation}
+\label{sec:failure}
+
+Each failure mode below can raise a reported AUROC without improving the probe's ability to flag a wrong answer. They are not independent: a benchmark can suffer from several at once. Table~\ref{tab:failure} summarizes them.
+
+\begin{table}[!t]
+\caption{Failure modes in probe evaluation}
+\label{tab:failure}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}L{2.35cm}YL{1.5cm}@{}}
+\toprule
+Failure mode & What goes wrong & Evidence \\
+\midrule
+A. Noisy labels & The ``correct'' label itself is often wrong & \cite{illusion2025,rethinking2026} \\
+B. Pooled metrics & Difficulty differences between questions inflate AUROC & \cite{seo2025aqe}, Sec.~\ref{sec:pilot} \\
+C. Question-side shortcuts & The probe predicts difficulty, not answer correctness & \cite{cencerrado2025noanswer,seo2025aqe} \\
+D. Text artifacts & Length or surface text alone separates the classes & \cite{illusion2025,hussain2026parallax} \\
+E. Weak generalization & Probes fail on new tasks or distributions & \cite{ood2025,orthogonal2025,geometrytruth2025} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Noisy Correctness Labels}
+Labels for free-form answers come from string overlap (exact match, ROUGE) or an LLM judge, and each makes errors. A re-evaluation of hallucination detectors found that ROUGE has high recall but very low precision against human judgement, and that some detectors lost up to 45.9\% of their measured performance when scored with an LLM judge instead~\cite{illusion2025}. A separate study reports that label noise hinders detection performance~\cite{rethinking2026}. A probe paper that does not audit its labels cannot separate probe error from label error.
+
+\textit{Recommendation:} report a human audit of a random sample of labels, with an agreement statistic, and show the main result under at least two label sources.
+
+\subsection{Pooled Metrics Mix Two Signals}
+\label{sec:pooled}
+Pooled AUROC compares answers across different questions. If the model is right on easy questions and wrong on hard ones, a probe that only detects difficulty will score well. That probe cannot help choose between two answers to the same question, which is what best-of-$N$ selection and answer filtering need. Within-question AUROC fixes this by comparing only answers to the same question:
+\begin{equation}
+\mathrm{AUC}_{WQ} = \frac{1}{|P|} \sum_{(i,j) \in P} \Big[ \mathbf{1}(s_i > s_j) + \tfrac{1}{2}\,\mathbf{1}(s_i = s_j) \Big],
+\label{eq:wq}
+\end{equation}
+where $P = \{(i,j): q_i = q_j,\ y_i = 1,\ y_j = 0\}$.
+
+Splits matter for the same reason. If answers to one question appear in both the training and test sets, a probe can learn to recognise the question instead of judging the answer, which inflates pooled scores further. Section~\ref{sec:pilot} shows the size of the effect on a real model: a question-only probe recovers most of the pooled AUROC.
+
+\textit{Recommendation:} sample several answers per question, report within-question AUROC beside pooled AUROC, and use question-grouped train/test splits.
+
+\subsection{Question-Side Shortcuts}
+Linear probes on the last question token, before any answer is generated, predict whether the model will answer correctly; this generalization weakens on math questions~\cite{cencerrado2025noanswer}. A Shapley-based analysis estimated how much of detector performance comes from the question side and concluded that existing detectors rely heavily on it~\cite{seo2025aqe}. A question-only probe is therefore a necessary baseline: an answer-level probe that does not beat it has not shown it reads the answer.
+
+\textit{Recommendation:} report a question-only probe trained on the same data, and the gap between it and the answer probe.
+
+\subsection{Text Artifacts and Missing Simple Baselines}
+On some benchmarks, surface features separate correct from incorrect answers. Response length alone rivalled complex detectors in one re-evaluation~\cite{illusion2025}. Four of six widely used corpora place the ground-truth answer in the prompt; on HaluEval a TF-IDF similarity score reaches 0.98 AUROC, and once this artifact is controlled most detectors fall to near chance~\cite{hussain2026parallax}.
+
+\textit{Recommendation:} report length and text-only classifiers as controls; flag any dataset where they come close to the probe.
+
+\subsection{Weak Generalization}
+Representation-based detectors trained on one distribution did not generalize out of distribution, and reported state of the art on RAGTruth was attributed largely to a spurious correlation~\cite{ood2025}. Truth directions learned on different tasks are near-orthogonal~\cite{orthogonal2025}, and their consistency depends on the model~\cite{geometrytruth2025}. Error-detection probes also fail to generalize across datasets~\cite{orgad2025know}.
+
+\textit{Recommendation:} report at least one cross-dataset test, and state the training distribution in the paper's main claims.
+
+%=====================================================
+\section{Evaluation Under Compression}
+\label{sec:compression}
+
+The studies that test probes or detectors under quantization report pooled metrics, so none can say whether the answer-level signal survives. Their conclusion, that detection holds up under 8- and 4-bit compression, is consistent with failure modes B and C: a probe could keep its question-level signal while losing its answer-level one.
+
+\subsection{What Has Been Measured}
+Table~\ref{tab:quant} summarizes existing studies.
+
+\begin{table}[!t]
+\caption{Studies of probes and detectors under quantization (all report pooled metrics only)}
+\label{tab:quant}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}L{2.25cm}L{2.15cm}Y@{}}
+\toprule
+Study & Setting; answers & Reported finding \\
+\midrule
+Aiersilan~\cite{aiersilan2026quantized} & NF4, 7--8B; supplied & AUROC 0.904--1.000; no full-precision baseline \\
+Fu et al.~\cite{truthfulnesseval2025} & 4- to 2-bit (AWQ, GPTQ, AQLM); statements & Internal truthful representations retained; more false outputs under deceptive prompts \\
+Tao et al.~\cite{revisiting2025} & Quantized LLMs; model answers & Quantization affects uncertainty estimation \\
+QuantProbe~\cite{quantprobe} (unreviewed) & FP16/\allowbreak INT8/\allowbreak INT4; supplied & Small cross-precision transfer effect \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{What Has Not Been Measured}
+\begin{itemize}
+\item Within-question AUROC at more than one precision.
+\item A question-only baseline at each precision, which would show how much pooled signal is difficulty.
+\item Cross-precision transfer at the answer level: does a probe trained at FP16 still rank answers to the same question after quantization?
+\item Separating representation change from behaviour change. A quantized model gives different answers, so its labels and answer set change too. Feeding the full-precision answers through the quantized model (teacher forcing) isolates the representation effect.
+\end{itemize}
+
+\subsection{KV-Cache Compression}
+Compressing the KV cache is a second, separate route to cheaper inference. Offline INT4 KV-cache quantization in RAG harmed faithfulness while INT8 was near-lossless~\cite{faithfulness2026}. That study used a hallucination detector to measure faithfulness; it did not test whether a probe trained on uncompressed states stays valid on compressed ones.
+
+%=====================================================
+\section{A Reporting Checklist for Probe Papers}
+\label{sec:checklist}
+
+The 12 items in Table~\ref{tab:checklist} turn Sections~\ref{sec:failure} and~\ref{sec:compression} into reporting requirements. Items 1--9 apply to every probe paper; items 10--12 apply when the paper claims anything about deployment or compressed models. We do not claim the list is complete. It is a minimum that would have prevented the specific problems documented in Section~\ref{sec:failure}.
+
+\begin{table}[!t]
+\caption{Reporting checklist (last column: met by our pilot study?)}
+\label{tab:checklist}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}L{0.3cm}YL{1.5cm}C{0.55cm}@{}}
+\toprule
+\# & Report this & Addresses & Pilot \\
+\midrule
+1 & How labels were produced, plus a human audit of a random sample with an agreement statistic & A. Labels & No \\
+2 & The main result under at least two label sources & A. Labels & No \\
+3 & Whether answers are the model's own (sampled or greedy) or supplied & Scope & Yes \\
+4 & Question-grouped train/validation/test splits & B. Pooled & Yes \\
+5 & Within-question AUROC beside pooled AUROC, with the number of mixed-correctness questions & B. Pooled & Yes \\
+6 & A question-only probe baseline on the same data & C. Question-side & Yes \\
+7 & Length and text-only (e.g., TF-IDF) baselines & D. Artifacts & Yes \\
+8 & Logit-based and sampling-based baselines & Context & Yes \\
+9 & At least one cross-dataset or out-of-distribution test & E. General\-ization & No \\
+10 & The precision and quantization method for probe training and testing & Compression & Yes \\
+11 & If precisions differ: per-precision results and cross-precision transfer, at the within-question level & Compression & Yes \\
+12 & Bootstrap CIs over questions; layer selected on validation only & Statistics & Yes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%=====================================================
+\section{Pilot Study: Applying the Checklist under 4-bit Quantization}
+\label{sec:pilot}
+
+To show what the checklist adds in practice, we ran a small experiment on the open question from Section~\ref{sec:compression}: does weight quantization remove answer-level probe signal faster than question-level signal?
+
+\subsection{Setup}
+\textbf{Model and data.} Qwen2.5-1.5B-Instruct~\cite{qwen2025report} on 1,000 questions sampled at random (seed 0) from the TriviaQA~\cite{joshi2017triviaqa} \texttt{rc.nocontext} validation split. For each question we generated one greedy answer and $K{=}10$ sampled answers (temperature 0.7, top-$p$ 0.95) at FP16, with a system prompt asking for a short answer.
+
+\textbf{Labels.} An answer is correct if, after lowercasing and removing punctuation and articles, it equals or contains any TriviaQA answer alias. Labels were not audited by hand (checklist items 1--2 unmet).
+
+\textbf{Precisions and extraction.} We used a teacher-forced design: the same FP16-generated question--answer text was fed through the model at FP16, INT8 (LLM.int8~\cite{dettmers2022int8}) and NF4 with double quantization~\cite{dettmers2023qlora}, so text and labels are identical across precisions and any change comes from the representation. We stored the residual-stream state at the last answer token (answer probe) and the last prompt token (question-only probe) for every fourth layer.
+
+\textbf{Probes and splits.} L2-regularized logistic regression on standardized features, with the regularization strength and layer chosen on validation pooled AUROC. Splits were grouped by question (60/20/20) and shared across precisions. Layer 16 was selected at every precision.
+
+\textbf{Baselines and statistics.} Mean token log-probability of the answer; sample agreement (share of the other nine samples with the same normalized answer); answer length; and a TF-IDF classifier on answer text (5-fold cross-validation grouped by question, within the test set). Confidence intervals come from a paired bootstrap over test questions (1,000 resamples for AUROC, 5,000 for best-of-$N$).
+
+\subsection{Results}
+Of the 1,000 questions, 202 were answered correctly in all ten samples, 540 in none, and 258 had mixed correctness; sample accuracy was 31.6\%. The test set held 200 questions, 58 of them mixed. Table~\ref{tab:pilot} gives the main results.
+
+\begin{table}[!t]
+\caption{Pilot results: Qwen2.5-1.5B-Instruct, TriviaQA, test set of 200 questions (2,000 answers). WQ = within-question AUROC.}
+\label{tab:pilot}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}YC{0.9cm}C{0.9cm}C{0.9cm}@{}}
+\toprule
+Metric & FP16 & INT8 & NF4 \\
+\midrule
+Greedy accuracy (all 1,000 q.) & 0.320 & 0.322 & 0.292 \\
+Answer probe, pooled AUROC & 0.852 & 0.855 & 0.834 \\
+Answer probe, WQ AUROC & 0.764 & 0.792 & 0.760 \\
+Question-only probe, pooled & 0.726 & 0.726 & 0.740 \\
+Log-probability, pooled & 0.799 & 0.795 & 0.756 \\
+Log-probability, WQ & 0.603 & 0.618 & 0.587 \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Text-only baselines (same for all precisions)}} \\
+Sample agreement, pooled / WQ & \multicolumn{3}{c}{0.819 / 0.688} \\
+Answer length (shorter = correct), pooled / WQ & \multicolumn{3}{c}{0.607 / 0.459} \\
+TF-IDF on answer text, pooled / WQ & \multicolumn{3}{c}{0.513 / 0.473} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Most pooled signal is question difficulty.} The question-only probe, which never sees an answer, reaches 0.726 pooled AUROC against 0.852 for the answer probe. Reporting pooled AUROC alone would overstate how well this probe judges individual answers (failure modes B and C).
+
+\textbf{A real answer-level signal exists.} Within-question AUROC is 0.764 at FP16 (95\% CI $[0.66, 0.86]$), well above chance and above both log-probability (0.603) and sample agreement (0.688) at the same level. The text-only controls are near chance (TF-IDF 0.51 pooled), so the signal is not a surface artifact; answer length carries a weak pooled signal (0.61).
+
+\textbf{No measurable loss under NF4.} Relative to FP16, NF4 changed pooled AUROC by $-0.017$ (95\% CI $[-0.036, 0.000]$) and within-question AUROC by $-0.002$ ($[-0.081, 0.088]$). INT8 changed them by $+0.004$ ($[-0.003, 0.010]$) and $+0.028$ ($[-0.019, 0.094]$). The share of above-chance signal retained under NF4 did not differ between the two metrics (retention gap, within-question minus pooled: $+0.06$, CI $[-0.21, 0.45]$). So the hypothesis that compression removes answer-level signal faster is not supported here, but the wide within-question intervals mean only drops larger than roughly 0.08 can be ruled out.
+
+\textbf{Probes transfer across precisions.} A probe trained on FP16 states and applied to NF4 states reached 0.829 pooled and 0.761 within-question AUROC, matching a probe trained on NF4 states (0.834 and 0.760). In this setting, retraining per precision was unnecessary.
+
+\textbf{Best-of-$N$ selection.} Choosing the sample with the highest probe score gave 41.5\% accuracy on test questions, against 35.5\% for greedy decoding, 36.5\% for majority voting, and a 49.5\% oracle (any sample correct). The gain over greedy was $+6.0$ points (95\% CI $[1.5, 11.0]$) and over majority voting $+5.0$ points ($[0.0, 10.0]$). Using NF4 states instead changed selection accuracy by $-1.5$ points ($[-4.0, 1.0]$).
+
+\subsection{What the Pilot Does Not Show}
+The study uses one 1.5B model, one dataset and rule-based labels. Only 58 test questions had mixed correctness, which limits precision for every within-question estimate. The teacher-forced design isolates representation change but does not test probes on answers the quantized model generated itself. The KV-cache setting was not tested. A larger replication with grouped cross-validation over all questions, more models and audited labels would be needed before drawing general conclusions.
+
+%=====================================================
+\section{Open Problems}
+\label{sec:open}
+
+Each problem in Table~\ref{tab:open} is stated with the experiment that would resolve it.
+
+\begin{table}[!t]
+\caption{Open problems and resolving experiments}
+\label{tab:open}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}YY@{}}
+\toprule
+Open problem & Experiment that would resolve it \\
+\midrule
+Does compression remove answer-level signal faster at larger scale or lower precision? & Our pilot protocol on several model sizes and 3- or 2-bit weights, with enough mixed-correctness questions for tight CIs \\
+Do probes stay valid under KV-cache compression? & Probe AUROC with the cache at 4 and 2 bits, weights at full precision \\
+Do probes work on answers a quantized model generates itself? & The pilot protocol with native rather than teacher-forced answers \\
+How much of reported progress survives label auditing? & Re-scoring published probes under audited labels and both label sources \\
+Do probes work on long-form answers? & Entity- or claim-level probes~\cite{obeso2025realtime} evaluated with within-response comparisons \\
+Can probe scores give guaranteed abstention? & Conformal calibration of probe scores~\cite{tayebati2025cap} under domain shift \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%=====================================================
+\section{Limitations}
+\begin{itemize}
+\item The review covers probes for short-answer QA; long-form and retrieval-grounded settings get less attention.
+\item Many cited works are 2025--2026 preprints that have not been peer reviewed; some findings may be revised.
+\item The search drew mainly on arXiv, the ACL Anthology and OpenReview; IEEE Xplore and the ACM Digital Library were not searched systematically.
+\item The taxonomy and checklist reflect the author's judgement, not a formal systematic-review protocol.
+\item The pilot study is small and single-model; see Section~\ref{sec:pilot}.
+\end{itemize}
+
+%=====================================================
+\section{Conclusion}
+High AUROCs for hallucination probes often reflect noisy labels, question difficulty, text artifacts or a narrow test distribution, rather than the ability to flag a specific wrong answer. The five failure modes in Section~\ref{sec:failure} each have a cheap fix, and the checklist in Section~\ref{sec:checklist} collects them. Our pilot shows why the fixes matter: a question-only probe recovered most of the pooled AUROC, while the within-question metric isolated a smaller but genuine answer-level signal. Under 4-bit weight quantization of a 1.5B model, that signal showed no measurable loss and transferred from FP16, though the study can rule out only large effects. Within-question evaluation across precisions, at larger scale, is the most direct next step.
+
+\FloatBarrier
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
